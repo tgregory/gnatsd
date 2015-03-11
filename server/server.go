@@ -32,6 +32,18 @@ type Info struct {
 	MaxPayload   int    `json:"max_payload"`
 }
 
+// Used for custom transport in embedded usage scenarios
+type ListenerCreator interface {
+	CreateListener(laddr string) (net.Listener, error)
+}
+
+// Default listener creator
+type TcpListenerCreator struct{}
+
+func (tlc TcpListenerCreator) CreateListener(laddr string) (net.Listener, error) {
+	return net.Listen("tcp", laddr)
+}
+
 // Server is our main struct.
 type Server struct {
 	mu       sync.Mutex
@@ -58,6 +70,9 @@ type Server struct {
 	routeInfo     Info
 	routeInfoJSON []byte
 	rcQuit        chan bool
+
+	// Used in custom transport setup
+	listenerCreator ListenerCreator
 }
 
 type stats struct {
@@ -69,6 +84,11 @@ type stats struct {
 
 // New will setup a new server struct after parsing the options.
 func New(opts *Options) *Server {
+	return NewCustom(opts, nil)
+}
+
+// Same as New but uses a custom listener/transport
+func NewCustom(opts *Options, listenerCreator ListenerCreator) *Server {
 	processOptions(opts)
 	info := Info{
 		ID:           genID(),
@@ -81,13 +101,14 @@ func New(opts *Options) *Server {
 	}
 
 	s := &Server{
-		info:  info,
-		sl:    sublist.New(),
-		opts:  opts,
-		debug: opts.Debug,
-		trace: opts.Trace,
-		done:  make(chan bool, 1),
-		start: time.Now(),
+		info:            info,
+		sl:              sublist.New(),
+		opts:            opts,
+		debug:           opts.Debug,
+		trace:           opts.Trace,
+		done:            make(chan bool, 1),
+		start:           time.Now(),
+		listenerCreator: listenerCreator,
 	}
 
 	s.mu.Lock()
@@ -107,6 +128,7 @@ func New(opts *Options) *Server {
 	s.handleSignals()
 
 	return s
+
 }
 
 // Sets the authentication method
@@ -269,7 +291,11 @@ func (s *Server) Shutdown() {
 func (s *Server) AcceptLoop() {
 	hp := fmt.Sprintf("%s:%d", s.opts.Host, s.opts.Port)
 	Noticef("Listening for client connections on %s", hp)
-	l, e := net.Listen("tcp", hp)
+	lc := s.listenerCreator
+	if nil == lc {
+		lc = TcpListenerCreator{}
+	}
+	l, e := lc.CreateListener(hp)
 	if e != nil {
 		Fatalf("Error listening on port: %s, %q", hp, e)
 		return
@@ -339,7 +365,12 @@ func (s *Server) StartHTTPMonitoring() {
 
 	hp := fmt.Sprintf("%s:%d", s.opts.Host, s.opts.HTTPPort)
 
-	l, err := net.Listen("tcp", hp)
+	lc := s.listenerCreator
+	if nil == lc {
+		lc = TcpListenerCreator{}
+	}
+
+	l, err := lc.CreateListener(hp)
 	if err != nil {
 		Fatalf("Can't listen to the monitor port: %v", err)
 	}
