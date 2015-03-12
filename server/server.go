@@ -46,11 +46,12 @@ func (tlc TcpListenerCreator) CreateListener(laddr string) (net.Listener, error)
 
 // Server is our main struct.
 type Server struct {
+	gcid     uint64
+	grid     uint64
 	mu       sync.Mutex
 	info     Info
 	infoJSON []byte
 	sl       *sublist.Sublist
-	gcid     uint64
 	opts     *Options
 	auth     Auth
 	trace    bool
@@ -66,7 +67,6 @@ type Server struct {
 	stats
 
 	routeListener net.Listener
-	grid          uint64
 	routeInfo     Info
 	routeInfoJSON []byte
 	rcQuit        chan bool
