@@ -70,6 +70,9 @@ type Server struct {
 	routeInfo     Info
 	routeInfoJSON []byte
 	rcQuit        chan bool
+
+	// Used in custom transport setup
+	listenerCreator ListenerCreator
 }
 
 type stats struct {
