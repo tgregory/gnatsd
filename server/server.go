@@ -32,47 +32,32 @@ type Info struct {
 	MaxPayload   int    `json:"max_payload"`
 }
 
-// Used for custom transport in embedded usage scenarios
-type ListenerCreator interface {
-	CreateListener(laddr string) (net.Listener, error)
-}
-
-// Default listener creator
-type TcpListenerCreator struct{}
-
-func (tlc TcpListenerCreator) CreateListener(laddr string) (net.Listener, error) {
-	return net.Listen("tcp", laddr)
-}
-
 // Server is our main struct.
 type Server struct {
 	gcid uint64
 	grid uint64
 	stats
-	mu       sync.Mutex
-	info     Info
-	infoJSON []byte
-	sl       *sublist.Sublist
-	opts     *Options
-	auth     Auth
-	trace    bool
-	debug    bool
-	running  bool
-	listener net.Listener
-	clients  map[uint64]*client
-	routes   map[uint64]*client
-	remotes  map[string]*client
-	done     chan bool
-	start    time.Time
-	http     net.Listener
+	mu        sync.Mutex
+	info      Info
+	infoJSON  []byte
+	sl        *sublist.Sublist
+	opts      *Options
+	auth      Auth
+	trace     bool
+	debug     bool
+	running   bool
+	listeners []net.Listener
+	clients   map[uint64]*client
+	routes    map[uint64]*client
+	remotes   map[string]*client
+	done      chan bool
+	start     time.Time
+	http      net.Listener
 
 	routeListener net.Listener
 	routeInfo     Info
 	routeInfoJSON []byte
 	rcQuit        chan bool
-
-	// Used in custom transport setup
-	listenerCreator ListenerCreator
 }
 
 type stats struct {
@@ -83,12 +68,16 @@ type stats struct {
 }
 
 // New will setup a new server struct after parsing the options.
-func New(opts *Options) *Server {
-	return NewCustom(opts, nil)
+func New(opts *Options) (*Server, error) {
+	l, e := net.Listen("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port))
+	if nil != e {
+		return nil, e
+	}
+	return NewCustom(opts, l), nil
 }
 
 // Same as New but uses a custom listener/transport
-func NewCustom(opts *Options, listenerCreator ListenerCreator) *Server {
+func NewCustom(opts *Options, listeners ...net.Listener) *Server {
 	processOptions(opts)
 	info := Info{
 		ID:           genID(),
@@ -101,14 +90,14 @@ func NewCustom(opts *Options, listenerCreator ListenerCreator) *Server {
 	}
 
 	s := &Server{
-		info:            info,
-		sl:              sublist.New(),
-		opts:            opts,
-		debug:           opts.Debug,
-		trace:           opts.Trace,
-		done:            make(chan bool, 1),
-		start:           time.Now(),
-		listenerCreator: listenerCreator,
+		info:      info,
+		sl:        sublist.New(),
+		opts:      opts,
+		debug:     opts.Debug,
+		trace:     opts.Trace,
+		done:      make(chan bool, 1),
+		start:     time.Now(),
+		listeners: listeners,
 	}
 
 	s.mu.Lock()
@@ -249,11 +238,11 @@ func (s *Server) Shutdown() {
 	doneExpected := 0
 
 	// Kick client AcceptLoop()
-	if s.listener != nil {
+	for i := range s.listeners {
 		doneExpected++
-		s.listener.Close()
-		s.listener = nil
+		s.listeners[i].Close()
 	}
+	s.listeners = make([]net.Listener, 0)
 
 	// Kick route AcceptLoop()
 	if s.routeListener != nil {
@@ -288,61 +277,41 @@ func (s *Server) Shutdown() {
 
 // AcceptLoop is exported for easier testing.
 func (s *Server) AcceptLoop() {
-	hp := fmt.Sprintf("%s:%d", s.opts.Host, s.opts.Port)
-	Noticef("Listening for client connections on %s", hp)
-	lc := s.listenerCreator
-	if nil == lc {
-		lc = TcpListenerCreator{}
-	}
-	l, e := lc.CreateListener(hp)
-	if e != nil {
-		Fatalf("Error listening on port: %s, %q", hp, e)
-		return
-	}
+	wg := &sync.WaitGroup{}
+	wg.Add(len(s.listeners))
+	for _, l := range s.listeners {
+		Noticef("Listening for client connections on %s", l.Addr().String())
 
-	Noticef("gnatsd is ready")
+		Noticef("gnatsd is ready")
 
-	// Setup state that can enable shutdown
-	s.mu.Lock()
-	s.listener = l
-	s.mu.Unlock()
+		tmpDelay := ACCEPT_MIN_SLEEP
 
-	// Write resolved port back to options.
-	_, port, err := net.SplitHostPort(l.Addr().String())
-	if err != nil {
-		Fatalf("Error parsing server address (%s): %s", l.Addr().String(), e)
-		return
-	}
-	portNum, err := strconv.Atoi(port)
-	if err != nil {
-		Fatalf("Error parsing server address (%s): %s", l.Addr().String(), e)
-		return
-	}
-	s.opts.Port = portNum
-
-	tmpDelay := ACCEPT_MIN_SLEEP
-
-	for s.isRunning() {
-		conn, err := l.Accept()
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				Debugf("Temporary Client Accept Error(%v), sleeping %dms",
-					ne, tmpDelay/time.Millisecond)
-				time.Sleep(tmpDelay)
-				tmpDelay *= 2
-				if tmpDelay > ACCEPT_MAX_SLEEP {
-					tmpDelay = ACCEPT_MAX_SLEEP
+		go func() {
+			for s.isRunning() {
+				conn, err := l.Accept()
+				if err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Temporary() {
+						Debugf("Temporary Client Accept Error(%v), sleeping %dms",
+							ne, tmpDelay/time.Millisecond)
+						time.Sleep(tmpDelay)
+						tmpDelay *= 2
+						if tmpDelay > ACCEPT_MAX_SLEEP {
+							tmpDelay = ACCEPT_MAX_SLEEP
+						}
+					} else if s.isRunning() {
+						Noticef("Accept error: %v", err)
+					}
+					continue
 				}
-			} else if s.isRunning() {
-				Noticef("Accept error: %v", err)
+				tmpDelay = ACCEPT_MIN_SLEEP
+				s.createClient(conn)
 			}
-			continue
-		}
-		tmpDelay = ACCEPT_MIN_SLEEP
-		s.createClient(conn)
+			Noticef("Server Exiting..")
+			s.done <- true
+			wg.Done()
+		}()
 	}
-	Noticef("Server Exiting..")
-	s.done <- true
+	wg.Wait()
 }
 
 // StartProfiler is called to enable dynamic profiling.
@@ -527,11 +496,16 @@ func (s *Server) NumSubscriptions() uint32 {
 }
 
 // Addr will return the net.Addr object for the current listener.
-func (s *Server) Addr() net.Addr {
+func (s *Server) Addr() []net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.listener == nil {
+	n := len(s.listeners)
+	if 0 == n {
 		return nil
 	}
-	return s.listener.Addr()
+	res := make([]net.Addr, 0, n)
+	for i := range s.listeners {
+		res[i] = s.listeners[i].Addr()
+	}
+	return res
 }
